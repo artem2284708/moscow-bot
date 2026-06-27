@@ -8,8 +8,19 @@ from datetime import datetime, timedelta
 import requests
 import numpy as np
 from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Location, LinkPreviewOptions
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, Defaults
+
+from geocode import (
+    fetch_track_routes,
+    format_route_label,
+    format_track_name_link,
+    geocode_query,
+    nearest_tracks,
+    resolve_user_geo,
+)
+
+NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
 # Настройка логирования
 logging.basicConfig(
@@ -439,6 +450,7 @@ def format_stats_message(
     stats: Dict,
     sector_stats: Optional[Dict] = None,
     overall_stats: Optional[Dict] = None,
+    user_geo: Optional[Dict[str, Any]] = None,
 ):
     """Format statistics into a single message"""
     
@@ -450,6 +462,19 @@ def format_stats_message(
     if overall_stats and overall_stats.get("position"):
         faster = overall_stats["faster_count"]
         message += f"📈 Быстрее вас: *{faster}* \n\n"
+
+    geo_point = resolve_user_geo(user_geo)
+    track_names = list(recommendations.keys())
+    routes_by_track = {}
+    if geo_point and track_names:
+        routes_by_track = fetch_track_routes(geo_point, track_names)
+        nearest = nearest_tracks(geo_point, track_names, limit=3)
+        if nearest:
+            message += "📍 *БЛИЖАЙШИЕ ЛОКАЦИИ (НА МАШИНЕ)*\n"
+            for i, (track, route) in enumerate(nearest, 1):
+                track_short = format_track_name_link(track, geo_point, max_len=25)
+                message += f"   {i}. {track_short} — *{format_route_label(route)}*\n"
+            message += "\n"
 
     message += "────────────────────" + "\n\n"
 
@@ -483,8 +508,11 @@ def format_stats_message(
         if easiest:
             message += f"   🎯 Самые лёгкие локации:\n"
             for i, (loc, seconds, target_time) in enumerate(easiest, 1):
-                loc_short = loc[:20] + "..." if len(loc) > 23 else loc
-                message += f"      {i}. `{loc_short}` (`{target_time}`) → "
+                loc_short = format_track_name_link(loc, geo_point, max_len=23)
+                dist_suffix = ""
+                if loc in routes_by_track:
+                    dist_suffix = f", {format_route_label(routes_by_track[loc])}"
+                message += f"      {i}. {loc_short} (`{target_time}`{dist_suffix}) → "
                 if seconds < 0.001:
                     message += "✅ \n"
                 else:
@@ -518,13 +546,15 @@ def format_stats_message(
 
     for item in tracks_sorted:
         track = item['track']
-        track_name_short = track[:25] + "..." if len(track) > 28 else track
+        track_name_short = format_track_name_link(track, geo_point, max_len=28)
         top_times = item['top_times']
         avg_str = item['avg_str']
         track_data = recommendations.get(track, {})
         faster_count = track_data.get("faster_count")
         
-        message += f"📍 *{track_name_short}*\n"
+        message += f"📍 {track_name_short}\n"
+        if track in routes_by_track:
+            message += f"   🗺 До локации: *{format_route_label(routes_by_track[track])}*\n"
         message += f"   ⏰ {', '.join([f'`{t}`' for t in top_times[:3]])}\n"
         message += f"   📊 Среднее время подиума: `{avg_str}`\n"
         message += f"   🏎 Быстрее вас: *{faster_count}* \n\n"
@@ -542,19 +572,22 @@ async def send_long_message(update: Update, text_messages: list, reply_markup=No
                 await update.callback_query.edit_message_text(
                     msg, 
                     reply_markup=markup,
-                    parse_mode='Markdown'
+                    parse_mode='Markdown',
+                    link_preview_options=NO_LINK_PREVIEW,
                 )
             else:
                 await update.callback_query.message.reply_text(
                     msg, 
                     reply_markup=markup,
-                    parse_mode='Markdown'
+                    parse_mode='Markdown',
+                    link_preview_options=NO_LINK_PREVIEW,
                 )
         else:
             await update.message.reply_text(
                 msg, 
                 reply_markup=markup,
-                parse_mode='Markdown'
+                parse_mode='Markdown',
+                link_preview_options=NO_LINK_PREVIEW,
             )
         
         # Небольшая задержка между сообщениями
@@ -584,7 +617,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 Для начала анализа отправь свою фамилию (например: Иванов)\n\n"
         "ℹ️ Доступные команды:\n"
         "/start - Показать это сообщение\n"
-        "/help - Помощь"
+        "/help - Помощь\n"
+        "/location - Указать адрес для расчёта расстояний"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -594,7 +628,47 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Отправь свою фамилию\n"
         "2. Если найдено несколько пользователей, выбери нужного с помощью кнопок\n"
         "3. Бот покажет подробную статистику твоих заездов\n\n"
+        "📍 Расстояния до локаций:\n"
+        "- /location <адрес> — например: /location метро Кузьминки\n"
+        "- или отправь геопозицию через «Поделиться локацией»\n"
+        "- в статистике показывается время в пути на машине\n\n"
         "Также можно использовать /start для повторного приветствия"
+    )
+
+def save_user_geo(context: ContextTypes.DEFAULT_TYPE, lat: float, lon: float, label: Optional[str] = None) -> None:
+    context.user_data["geo"] = {"lat": lat, "lon": lon, "label": label}
+
+async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set user location by address for distance calculations."""
+    query = " ".join(context.args).strip() if context.args else ""
+    if not query:
+        await update.message.reply_text(
+            "📍 Отправь адрес после команды, например:\n"
+            "`/location метро Кузьминки, Москва`\n\n"
+            "Или поделись геопозицией через вложения → «Локация».",
+            parse_mode="Markdown",
+        )
+        return
+
+    searching_msg = await update.message.reply_text(f"🔍 Ищу координаты для «{query}»...")
+    point = geocode_query(f"{query}, Москва, Россия" if "моск" not in query.lower() else query)
+    if not point:
+        await searching_msg.edit_text("❌ Адрес не найден. Попробуй уточнить запрос.")
+        return
+
+    save_user_geo(context, point.lat, point.lon, point.label)
+    await searching_msg.edit_text(
+        f"✅ Локация сохранена.\n"
+        f"📍 {point.label}\n\n"
+        f"Теперь в статистике будут показаны расстояния и время в пути на машине."
+    )
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Telegram shared location."""
+    location: Location = update.message.location
+    save_user_geo(context, location.latitude, location.longitude, "Telegram")
+    await update.message.reply_text(
+        "✅ Геопозиция сохранена. Расстояния и время в пути на машине появятся в статистике."
     )
 
 async def handle_last_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -639,7 +713,8 @@ async def handle_last_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats = calculate_stats(my_time, recommendations)
             sector_stats = calculate_sector_stats(recommendations)
             stats_messages = format_stats_message(
-                my_time, user['name'], recommendations, stats, sector_stats, overall_stats
+                my_time, user['name'], recommendations, stats, sector_stats, overall_stats,
+                context.user_data.get('geo'),
             )
             
             await status_msg.delete()
@@ -715,7 +790,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats = calculate_stats(my_time, recommendations)
             sector_stats = calculate_sector_stats(recommendations)
             stats_messages = format_stats_message(
-                my_time, user_name, recommendations, stats, sector_stats, overall_stats
+                my_time, user_name, recommendations, stats, sector_stats, overall_stats,
+                context.user_data.get('geo'),
             )
             
             # Сохраняем данные для будущих обновлений
@@ -770,7 +846,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stats = calculate_stats(my_time, recommendations)
             sector_stats = calculate_sector_stats(recommendations)
             stats_messages = format_stats_message(
-                my_time, selected_user['name'], recommendations, stats, sector_stats, overall_stats
+                my_time, selected_user['name'], recommendations, stats, sector_stats, overall_stats,
+                context.user_data.get('geo'),
             )
             
             await status_msg.delete()
@@ -801,11 +878,18 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Start the bot."""
     # Create Application
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .defaults(Defaults(link_preview_options=NO_LINK_PREVIEW))
+        .build()
+    )
 
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("location", location_command))
+    application.add_handler(MessageHandler(filters.LOCATION, handle_location))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_last_name))
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
