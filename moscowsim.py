@@ -37,9 +37,6 @@ if not BOT_TOKEN:
 BASE_URL = "https://moscowsim.ru"
 START_URL = BASE_URL
 
-# FOR TESTING - hardcoded time
-HARDCODED_TIME = "1:28.700"  # <-- ADD THIS LINE
-
 # Хранилище состояний пользователей с временем создания
 user_states: Dict[int, Dict[str, Any]] = {}
 
@@ -315,14 +312,8 @@ def get_recommendations(my_tr_id: str) -> Tuple[Optional[str], Optional[Dict[str
     if not links:
         return None, None, {}, {}
     
-    # START OF CHANGES
-    # Use hardcoded time if defined, otherwise set to None
-    if 'HARDCODED_TIME' in globals():
-        my_time = HARDCODED_TIME
-    else:
-        my_time = None
-    # END OF CHANGES
-    
+    my_time = None
+
     my_entry = None
     recommendations = {}
     overall_stats = {}
@@ -333,11 +324,7 @@ def get_recommendations(my_tr_id: str) -> Tuple[Optional[str], Optional[Dict[str
         )
         if my_entry_from_page and not my_entry:
             my_entry = my_entry_from_page
-            # START OF CHANGES
-            # Only set from page if not using hardcoded time
-            if not my_time:
-                my_time = my_entry_from_page["lap"]
-            # END OF CHANGES
+            my_time = my_entry_from_page["lap"]
 
         if i == 0:
             overall_stats = {"all_entries": all_entries, "my_entry": my_entry_from_page}
